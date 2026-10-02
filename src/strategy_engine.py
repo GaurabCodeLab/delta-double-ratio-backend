@@ -4,11 +4,12 @@ import asyncio
 import contextlib
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from src.config import Settings
 from src.exchange_client import DeltaExchangeClient
+from src.models import OptionLeg
 from src.order_executor import OrderExecutor
 from src.position_manager import PositionManager
 
@@ -32,6 +33,11 @@ class StrategyState:
     status: str = "initializing"
     trigger_price: Optional[str] = None
     trigger_pnl: Optional[float] = None
+    realized_pnl_total: float = 0.0
+    unrealized_pnl_total: float = 0.0
+    combined_pnl_total: float = 0.0
+    tracked_product_ids: set[int] = field(default_factory=set)
+    previous_open_legs: Optional[list[OptionLeg]] = None
     call_ratio_state: Optional[RatioState] = None
     put_ratio_state: Optional[RatioState] = None
 
@@ -92,9 +98,32 @@ class StrategyEngine:
         active_ratios: dict[str, RatioSpread] = {}  # {"call": RatioSpread, "put": RatioSpread}
         wait_cycles = 0
         ratio_scan_task = None
+        has_active_session = False
 
         try:
             while True:
+                current_open_legs: list[OptionLeg] | None = None
+                position_reconciliation_complete = True
+                try:
+                    current_open_legs = await self.exchange.parse_option_positions()
+                    if self.state.previous_open_legs is not None:
+                        previous_tracked_legs = [
+                            leg for leg in self.state.previous_open_legs
+                            if leg.product_id in self.state.tracked_product_ids
+                        ]
+                        current_tracked_legs = [
+                            leg for leg in current_open_legs
+                            if leg.product_id in self.state.tracked_product_ids
+                        ]
+                        self.state.realized_pnl_total += await self.positions.reconcile_realized_pnl(
+                            previous_tracked_legs,
+                            current_tracked_legs,
+                        )
+                    self.state.previous_open_legs = current_open_legs
+                except Exception as exc:
+                    LOGGER.error("Position snapshot or realized PnL reconciliation failed: %s", exc)
+                    position_reconciliation_complete = False
+
                 # If no active ratios, scan for them
                 if not active_ratios:
                     self._set_strategy_state(
@@ -119,6 +148,7 @@ class StrategyEngine:
                             for ratio in found_ratios:
                                 ratio_id = self._get_ratio_id(ratio)
                                 active_ratios[ratio_id] = ratio
+                                self.state.tracked_product_ids.update((ratio.long_leg.product_id, ratio.short_leg.product_id))
                                 LOGGER.info(
                                     "Detected %s ratio spread ratio=%.2f long=%s @%.2f short=%s @%.2f",
                                     ratio_id,
@@ -128,6 +158,7 @@ class StrategyEngine:
                                     abs(ratio.short_leg.size),
                                     ratio.short_leg.strike,
                                 )
+                            has_active_session = has_active_session or bool(found_ratios)
 
                             # Update state
                             call_status = "detected" if "call" in active_ratios else "not found"
@@ -161,8 +192,9 @@ class StrategyEngine:
                                     wait_cycles,
                                     str(exc),
                                 )
-                            await asyncio.sleep(self.settings.poll_interval_seconds)
-                            continue
+                            if not has_active_session:
+                                await asyncio.sleep(self.settings.poll_interval_seconds)
+                                continue
                     else:
                         wait_cycles += 1
                         try:
@@ -178,8 +210,9 @@ class StrategyEngine:
                                 "no ratio spread found | BTC index=unavailable | attempt=%s | status=scan in progress",
                                 wait_cycles,
                             )
-                        await asyncio.sleep(self.settings.poll_interval_seconds)
-                        continue
+                        if not has_active_session:
+                            await asyncio.sleep(self.settings.poll_interval_seconds)
+                            continue
 
                 # Monitor all active ratios
                 self._set_strategy_state(
@@ -191,9 +224,12 @@ class StrategyEngine:
                 )
 
                 # Verify positions still exist
+                ratios_verified = False
                 try:
                     current_ratios = await self.positions.detect_ratio_spreads(self.settings.ratio_spreads)
+                    ratios_verified = True
                     current_ids = {self._get_ratio_id(r) for r in current_ratios}
+                    active_ratios.update({self._get_ratio_id(r): r for r in current_ratios})
 
                     # Remove any that are no longer present
                     removed_ids = set(active_ratios.keys()) - current_ids
@@ -208,8 +244,24 @@ class StrategyEngine:
                     LOGGER.info("failed to verify active ratios, continuing with existing state")
                     pass
 
+                if not ratios_verified and current_open_legs is not None:
+                    legs_by_id = {leg.product_id: leg for leg in current_open_legs}
+                    for ratio_id, ratio in list(active_ratios.items()):
+                        long_leg = legs_by_id.get(ratio.long_leg.product_id)
+                        short_leg = legs_by_id.get(ratio.short_leg.product_id)
+                        if long_leg is None or short_leg is None or long_leg.size <= 0 or short_leg.size >= 0:
+                            LOGGER.info("%s ratio changed in the open book; removing stale spread snapshot", ratio_id)
+                            del active_ratios[ratio_id]
+                            if ratio_id == "call":
+                                self.state.call_ratio_state = None
+                            elif ratio_id == "put":
+                                self.state.put_ratio_state = None
+                        else:
+                            ratio.long_leg = long_leg
+                            ratio.short_leg = short_leg
+
                 # If all ratios were removed, reset and scan again
-                if not active_ratios:
+                if not active_ratios and not has_active_session:
                     await asyncio.sleep(self.settings.poll_interval_seconds)
                     continue
 
@@ -222,14 +274,17 @@ class StrategyEngine:
                     index_price = None
 
                 # Monitor all active ratios and compute overall portfolio PnL
-                total_portfolio_pnl = 0.0
+                total_portfolio_pnl = self.state.realized_pnl_total
                 ratio_pnls: dict[str, float] = {}  # Track individual PnL for logging
+                monitored_product_ids: set[int] = set()
+                pnl_calculation_complete = current_open_legs is not None and position_reconciliation_complete
 
                 for ratio_id, ratio in active_ratios.items():
                     try:
                         pnl = await self.positions.compute_unrealized_pnl(ratio)
                         ratio_pnls[ratio_id] = pnl
                         total_portfolio_pnl += pnl
+                        monitored_product_ids.update((ratio.long_leg.product_id, ratio.short_leg.product_id))
 
                         long_q = await self.exchange.get_best_quote(ratio.long_leg.product_id)
                         short_q = await self.exchange.get_best_quote(ratio.short_leg.product_id)
@@ -274,11 +329,23 @@ class StrategyEngine:
 
                     except Exception as e:
                         LOGGER.error("Error monitoring %s ratio: %s", ratio_id, str(e))
+                        pnl_calculation_complete = False
+
+                if current_open_legs is not None:
+                    for leg in current_open_legs:
+                        if leg.product_id not in self.state.tracked_product_ids or leg.product_id in monitored_product_ids:
+                            continue
+                        try:
+                            total_portfolio_pnl += await self.positions.compute_unrealized_leg_pnl(leg)
+                        except Exception as exc:
+                            LOGGER.error("Error monitoring unmatched position %s: %s", leg.product_id, exc)
+                            pnl_calculation_complete = False
 
                 # Log overall portfolio PnL
                 pnl_breakdown = ", ".join(f"{k}={v:.2f}" for k, v in ratio_pnls.items())
                 LOGGER.info(
-                    "Portfolio PnL check | total_pnl=%.4f | breakdown=[%s] | thresholds=[profit=%s, loss=%s]",
+                    "Portfolio PnL check | realized_pnl=%.4f | total_pnl=%.4f | breakdown=[%s] | thresholds=[profit=%s, loss=%s]",
+                    self.state.realized_pnl_total,
                     total_portfolio_pnl,
                     pnl_breakdown,
                     self.settings.profit_exit_threshold_usd,
@@ -286,7 +353,10 @@ class StrategyEngine:
                 )
 
                 # Check exit thresholds on OVERALL portfolio PnL
-                if total_portfolio_pnl >= self.settings.profit_exit_threshold_usd or total_portfolio_pnl <= self.settings.loss_exit_threshold_usd:
+                if pnl_calculation_complete and (
+                    total_portfolio_pnl >= self.settings.profit_exit_threshold_usd
+                    or total_portfolio_pnl <= self.settings.loss_exit_threshold_usd
+                ):
                     self._set_strategy_state(
                         action="closing all positions",
                         status="overall pnl threshold reached",
@@ -303,21 +373,59 @@ class StrategyEngine:
                         self.settings.loss_exit_threshold_usd,
                     )
 
-                    # Close all active ratios
-                    for ratio_id, ratio in list(active_ratios.items()):
+                    # Close only legs belonging to spreads this strategy detected.
+                    legs_to_close = {
+                        leg.product_id: leg
+                        for leg in (current_open_legs or [])
+                        if leg.product_id in self.state.tracked_product_ids
+                    }
+                    for ratio in active_ratios.values():
+                        legs_to_close.setdefault(ratio.long_leg.product_id, ratio.long_leg)
+                        legs_to_close.setdefault(ratio.short_leg.product_id, ratio.short_leg)
+
+                    for leg in legs_to_close.values():
                         try:
-                            await self._close_entire_ratio(ratio)
-                            del active_ratios[ratio_id]
-                            LOGGER.info("Closed %s ratio", ratio_id)
+                            await self.executor.execute_market_single_submission_with_fill_confirmation(
+                                product_id=leg.product_id,
+                                side="sell" if leg.size > 0 else "buy",
+                                size=abs(leg.size),
+                                reduce_only=True,
+                            )
+                            LOGGER.info("Closed tracked product %s", leg.product_id)
                         except Exception as e:
-                            LOGGER.error("Error closing %s ratio: %s", ratio_id, str(e))
+                            LOGGER.error("Error closing product %s: %s", leg.product_id, str(e))
+
+                    try:
+                        post_close_legs = await self.exchange.parse_option_positions()
+                        before_close_tracked = [
+                            leg for leg in (current_open_legs or [])
+                            if leg.product_id in self.state.tracked_product_ids
+                        ]
+                        after_close_tracked = [
+                            leg for leg in post_close_legs
+                            if leg.product_id in self.state.tracked_product_ids
+                        ]
+                        self.state.realized_pnl_total += await self.positions.reconcile_realized_pnl(
+                            before_close_tracked,
+                            after_close_tracked,
+                        )
+                        self.state.previous_open_legs = post_close_legs
+                    except Exception as exc:
+                        LOGGER.error("Could not reconcile bot close fills: %s", exc)
 
                     # Clear all ratio states
                     self.state.call_ratio_state = None
                     self.state.put_ratio_state = None
 
                     LOGGER.info("All ratio spreads have been closed")
+                    if pnl_calculation_complete:
+                        self.state.unrealized_pnl_total = total_portfolio_pnl - self.state.realized_pnl_total
+                        self.state.combined_pnl_total = total_portfolio_pnl
                     return
+
+                if pnl_calculation_complete:
+                    self.state.unrealized_pnl_total = total_portfolio_pnl - self.state.realized_pnl_total
+                    self.state.combined_pnl_total = total_portfolio_pnl
 
                 await asyncio.sleep(self.settings.poll_interval_seconds)
         finally:

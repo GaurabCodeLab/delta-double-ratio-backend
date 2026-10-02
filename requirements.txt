@@ -1,4 +1,4 @@
-delta-rest-client
+delta-rest-client>=1.0.14
 tenacity
 pydantic>=2
 python-dotenv

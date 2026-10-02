@@ -265,6 +265,51 @@ class DeltaExchangeClient:
                 return result[0]
         return {}
 
+    async def get_recent_fills(self, product_id: Optional[int] = None, limit: int = 500) -> List[Dict[str, Any]]:
+        if limit <= 0:
+            return []
+
+        limit = min(limit, 5000)
+        page_size = min(100, limit)
+        query: Dict[str, Any] = {}
+        if product_id is not None:
+            query["product_id"] = product_id
+
+        fills: List[Dict[str, Any]] = []
+        after: Optional[str] = None
+        seen_cursors: set[str] = set()
+
+        while len(fills) < limit:
+            page = await self._call(
+                "fills",
+                query=dict(query),
+                page_size=min(page_size, limit - len(fills)),
+                after=after,
+            )
+            if not isinstance(page, dict):
+                raise ExchangeClientError("Unexpected fills response: expected an object")
+            if page.get("success") is False:
+                raise ExchangeClientError(f"Unable to fetch fills: {page.get('error') or page.get('message')}")
+
+            result = page.get("result")
+            if not isinstance(result, list):
+                raise ExchangeClientError("Unexpected fills response: result must be a list")
+            if any(not isinstance(fill, dict) for fill in result):
+                raise ExchangeClientError("Unexpected fills response: fill entries must be objects")
+            fills.extend(result)
+
+            meta = page.get("meta")
+            next_cursor = meta.get("after") if isinstance(meta, dict) else None
+            if not result or not next_cursor:
+                break
+            next_cursor = str(next_cursor)
+            if next_cursor in seen_cursors:
+                raise ExchangeClientError("Fills pagination returned a repeated cursor")
+            seen_cursors.add(next_cursor)
+            after = next_cursor
+
+        return fills[:limit]
+
     async def parse_option_positions(self) -> List[OptionLeg]:
         positions = await self.get_open_positions_raw()
         legs: List[OptionLeg] = []

@@ -13,6 +13,7 @@ from src.strategy_engine import StrategyEngine
 class FakeExchange:
     def __init__(self) -> None:
         self.index_price = 100.0
+        self.open_legs: list[OptionLeg] = []
         self.quote_map = {
             1: Quote(best_bid=101.0, best_ask=102.0),
             2: Quote(best_bid=100.5, best_ask=101.5),
@@ -25,6 +26,9 @@ class FakeExchange:
 
     async def get_best_quote(self, product_id: int) -> Quote:
         return self.quote_map[product_id]
+
+    async def parse_option_positions(self) -> list[OptionLeg]:
+        return self.open_legs
 
 
 class FakePositions:
@@ -40,6 +44,13 @@ class FakePositions:
         if ratio.long_leg.option_type == "call":
             return 12.0
         return 3.0
+
+    async def reconcile_realized_pnl(
+        self,
+        previous_open_legs: list[OptionLeg],
+        current_open_legs: list[OptionLeg],
+    ) -> float:
+        return 0.0
 
 
 class FakeExecutor:

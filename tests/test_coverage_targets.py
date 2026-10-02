@@ -125,6 +125,9 @@ class FakeDeltaRestClient:
     def order_history(self, **kwargs):
         return {"result": [{"id": "ord-123", "product_id": kwargs.get("query", {}).get("product_id")} ]}
 
+    def fills(self, query=None, page_size=100, after=None):
+        return {"success": True, "result": [], "meta": {}}
+
 
 @pytest.fixture
 def fake_delta_client_module(monkeypatch):
@@ -203,6 +206,34 @@ async def test_exchange_client_runtime_paths_are_covered(fake_delta_client_modul
     legs = await exchange.parse_option_positions()
     assert len(legs) == 2
     assert [leg.option_type for leg in legs] == ["call", "put"]
+
+    class PaginatedFillsClient:
+        def __init__(self) -> None:
+            self.cursors = []
+
+        def fills(self, query=None, page_size=100, after=None):
+            self.cursors.append(after)
+            if after is None:
+                return {
+                    "success": True,
+                    "result": [{"id": "fill-1", "product_id": 1001}],
+                    "meta": {"after": "next-page"},
+                }
+            return {"success": True, "result": [{"id": "fill-2", "product_id": 1001}], "meta": {}}
+
+    fills_client = PaginatedFillsClient()
+    exchange._client = fills_client
+    fills = await exchange.get_recent_fills(product_id=1001, limit=2)
+    assert [fill["id"] for fill in fills] == ["fill-1", "fill-2"]
+    assert fills_client.cursors == [None, "next-page"]
+
+    class FailedFillsClient:
+        def fills(self, query=None, page_size=100, after=None):
+            return {"success": False, "error": "fills unavailable", "result": []}
+
+    exchange._client = FailedFillsClient()
+    with pytest.raises(ExchangeClientError, match="fills unavailable"):
+        await exchange.get_recent_fills(product_id=1001)
 
 
 @pytest.mark.asyncio

@@ -88,6 +88,9 @@ class BotManager:
         
         try:
             legs = await exchange.parse_option_positions()
+            tracked_product_ids = self.strategy.state.tracked_product_ids
+            if tracked_product_ids:
+                legs = [leg for leg in legs if leg.product_id in tracked_product_ids]
             logger.info(f"Parsed {len(legs)} option positions")
         except Exception as e:
             logger.error(f"Failed to parse option positions: {str(e)}")
@@ -139,11 +142,26 @@ class BotManager:
                 logger.error(f"Error processing position for product {leg.product_id}: {str(e)}")
                 continue
 
-        logger.info(f"Summary collected: {len(positions)} positions, total_pnl={total_pnl}")
+        realized_pnl = self.strategy.state.realized_pnl_total
+        combined_pnl = realized_pnl + total_pnl
+        self.strategy.state.unrealized_pnl_total = total_pnl
+        self.strategy.state.combined_pnl_total = combined_pnl
+        logger.info(
+            "Summary collected: positions=%s unrealized_pnl=%s realized_pnl=%s combined_pnl=%s",
+            len(positions),
+            total_pnl,
+            realized_pnl,
+            combined_pnl,
+        )
         
         return {
             "index_price": index_price,
             "unrealized_pnl": total_pnl,
+            "realized_pnl": realized_pnl,
+            "combined_pnl": combined_pnl,
+            "strategy_realized_pnl": realized_pnl,
+            "closed_positions": self.strategy.positions.closed_positions,
+            "closed_position_count": len(self.strategy.positions.closed_positions),
             "profit_exit_threshold_usd": self.strategy.settings.profit_exit_threshold_usd,
             "loss_exit_threshold_usd": self.strategy.settings.loss_exit_threshold_usd,
             "allowed_ratio_spreads": self.strategy.settings.ratio_spreads,
@@ -189,6 +207,10 @@ class BotManager:
                 "status": self.strategy.state.status,
                 "trigger_price": self.strategy.state.trigger_price,
                 "trigger_pnl": self.strategy.state.trigger_pnl,
+                "realized_pnl": self.strategy.state.realized_pnl_total,
+                "realized_pnl_total": self.strategy.state.realized_pnl_total,
+                "unrealized_pnl": self.strategy.state.unrealized_pnl_total,
+                "combined_pnl": self.strategy.state.combined_pnl_total,
                 "profit_exit_threshold_usd": self.strategy.settings.profit_exit_threshold_usd,
                 "loss_exit_threshold_usd": self.strategy.settings.loss_exit_threshold_usd,
                 "allowed_ratio_spreads": self.strategy.settings.ratio_spreads,

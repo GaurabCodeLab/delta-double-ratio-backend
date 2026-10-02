@@ -33,6 +33,7 @@ The bot scans open option positions and identifies a valid ratio spread where al
 Once a configured ratio spread is found, the bot:
 
 - continuously monitors the overall unrealized PnL of the active ratio spread
+- reconciles observed position reductions against Delta fill history and includes gross realized PnL in its exit total
 - does not rebalance, roll, convert, or open new offsetting positions
 - closes all open ratio spread positions immediately when either condition is met:
   - profit reaches the configured profit threshold
@@ -70,6 +71,10 @@ python -m src.main
 - `RATIO_SPREADS` (default: `1:2`). Supports multiple comma-separated values like `1:2,1:3,1:5`.
 
 Heartbeat logs run on the same interval as `POLL_INTERVAL_SECONDS`.
+
+Realized PnL tracking is in-memory for the lifetime of the bot process. It requires identifiable, timestamped fills from Delta's fills API; if fill history cannot cover an observed reduction, the bot does not use an incomplete PnL total to trigger an exit. Commissions and fees are not included in the realized PnL calculation.
+
+The `/summary` response includes `closed_positions` and `closed_position_count`. Each closed-position record is fill-level and includes `symbol`, `type`, `strike`, `expiry`, `side`, signed `size`, `entry`, `closed_price`, `closed_time`, and `realized_pnl`, along with fill/product IDs and additional descriptive aliases. Records are retained in memory for the bot process lifetime.
 
 ## Testing
 
